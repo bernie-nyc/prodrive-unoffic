@@ -3,7 +3,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEBCLIENTS_DIR = REPO_ROOT / "WebClients"
-DRIVE_APP_DIR = WEBCLIENTS_DIR / "applications/drive/src/app"
+MAIN_CONTAINER_PATH = WEBCLIENTS_DIR / "applications/drive/src/app/containers/MainContainer.tsx"
+
 BRIDGE_FILENAME = "ProtonDriveLinuxSyncBridge.tsx"
 
 BRIDGE_SOURCE = """import { useEffect, useRef } from 'react';
@@ -149,24 +150,22 @@ def fail(message: str) -> None:
     raise SystemExit(f"❌ {message}")
 
 
-def find_drive_provider() -> Path:
-    for path in DRIVE_APP_DIR.rglob("DriveProvider.tsx"):
-        source = path.read_text()
-        if "export function DriveProvider" in source and "<UploadProvider>" in source:
-            return path
-    fail("Unable to find DriveProvider.tsx with UploadProvider in current WebClients layout")
+def find_main_container() -> Path:
+    if not MAIN_CONTAINER_PATH.exists():
+        fail("Unable to find MainContainer.tsx in current WebClients layout")
+    return MAIN_CONTAINER_PATH
 
 
-def patch_drive_provider(path: Path) -> None:
+def patch_main_container(path: Path) -> None:
     source = path.read_text()
     if "ProtonDriveLinuxSyncBridge" not in source:
         source = source.replace(
-            "import { PublicSessionProvider } from './_api';\n",
-            "import { PublicSessionProvider } from './_api';\nimport { ProtonDriveLinuxSyncBridge } from './ProtonDriveLinuxSyncBridge';\n",
+            "import { DriveProvider, useActivePing, useDriveEventManager, useSearchControl } from '../legacy/store';\n",
+            "import { ProtonDriveLinuxSyncBridge } from './ProtonDriveLinuxSyncBridge';\nimport { DriveProvider, useActivePing, useDriveEventManager, useSearchControl } from '../legacy/store';\n",
         )
         source = source.replace(
-            "                                <UploadProvider>\n                                    <SearchProvider>",
-            "                                <UploadProvider>\n                                    <ProtonDriveLinuxSyncBridge />\n                                    <SearchProvider>",
+            "                <DriveProvider>\n                    <SubscriptionModalProvider app={config.APP_NAME}>",
+            "                <DriveProvider>\n                    <ProtonDriveLinuxSyncBridge />\n                    <SubscriptionModalProvider app={config.APP_NAME}>",
         )
     path.write_text(source)
 
@@ -175,10 +174,10 @@ def main() -> None:
     if not WEBCLIENTS_DIR.exists():
         fail("WebClients directory is missing")
 
-    provider_path = find_drive_provider()
-    bridge_path = provider_path.parent / BRIDGE_FILENAME
+    container_path = find_main_container()
+    bridge_path = container_path.parent / BRIDGE_FILENAME
     bridge_path.write_text(BRIDGE_SOURCE)
-    patch_drive_provider(provider_path)
+    patch_main_container(container_path)
     print(f"  ✓ Installed Proton Drive Linux sync bridge at {bridge_path.relative_to(WEBCLIENTS_DIR)}")
 
 
