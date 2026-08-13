@@ -43,7 +43,7 @@ runs:
     - name: Clone WebClients
       shell: bash
       run: |
-        git clone --depth=1 --single-branch --branch "${WEBCLIENTS_REF}" https://github.com/ProtonMail/WebClients.git WebClients
+        GIT_TERMINAL_PROMPT=0 git clone --depth=1 --single-branch --branch "${WEBCLIENTS_REF}" https://github.com/ProtonMail/WebClients.git WebClients
 
     - name: Apply distro patch
       shell: bash
