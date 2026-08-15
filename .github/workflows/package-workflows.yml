@@ -176,7 +176,14 @@ jobs:
       - build_deb_debian_13
       - build_deb_ubuntu_24_04
       - build_deb_ubuntu_26_04
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.workflow == 'release'
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.workflow == 'all' || inputs.workflow == 'release') &&
+      needs.build_deb_debian_12.result != 'failure' &&
+      needs.build_deb_debian_13.result != 'failure' &&
+      needs.build_deb_ubuntu_24_04.result != 'failure' &&
+      needs.build_deb_ubuntu_26_04.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
