@@ -101,6 +101,7 @@ if [ -d "$PATCHES_DIR" ]; then
 fi
 cd "$REPO_ROOT"
 python3 scripts/patch_drive_linux_sync_bridge.py
+python3 scripts/patch_drive_linux_claude_bridge.py
 cd "$WEBCLIENTS_DIR"
 
 # 3. Install dependencies in WebClients
