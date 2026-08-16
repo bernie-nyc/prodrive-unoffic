@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+mod claude;
+use claude::{claude_chat, claude_clear_api_key, claude_get_key_configured, claude_set_api_key};
+
 /// Live sync module — monitors local filesystem changes and syncs with Proton Drive.
 mod live_sync;
 mod proton_navigation;
@@ -1869,7 +1872,12 @@ fn main() {
             set_sync_root,
             handle_remote_update,
             read_sync_file,
-            get_sync_device_name
+            get_sync_device_name,
+            // Claude AI connector
+            claude_set_api_key,
+            claude_get_key_configured,
+            claude_clear_api_key,
+            claude_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
