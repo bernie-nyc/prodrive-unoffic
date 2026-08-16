@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+Proton Drive MCP server — bridges Claude Desktop stdio to the running
+Proton Drive desktop client.
+
+The Proton Drive desktop client starts a local HTTP server and writes its
+port to a temp file.  This script reads that port, then implements the MCP
+stdio protocol so Claude Desktop can call Proton Drive tools.
+
+Configure Claude Desktop (claude_desktop_config.json):
+
+  {
+    "mcpServers": {
+      "proton-drive": {
+        "command": "/usr/local/bin/proton-drive-mcp"
+      }
+    }
+  }
+
+On Windows, replace the command path with wherever the script is installed,
+e.g. "C:\\Program Files\\ProtonDrive\\mcp\\proton-drive-mcp".
+
+Requirements: Python 3.8+, no third-party packages.
+"""
+
+import json
+import platform
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PORT_FILE = Path(tempfile.gettempdir()) / "proton-drive-mcp.port"
+
+TOOLS = [
+    {
+        "name": "list_devices",
+        "description": (
+            "List Linux computers (devices) that are synced to this Proton Drive account. "
+            "Returns each device's name and root folder identifier."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_drive_status",
+        "description": (
+            "Check whether the Proton Drive desktop client is running and whether "
+            "the Claude API key has been configured inside it."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+
+def find_port(timeout: float = 5.0) -> int | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            text = PORT_FILE.read_text().strip()
+            port = int(text)
+            if port > 0:
+                return port
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    return None
+
+
+def http_post(port: int, path: str, body: dict) -> dict:
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=35) as resp:
+        return json.loads(resp.read())
+
+
+def send(msg: dict) -> None:
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def error_response(msg_id, code: int, message: str) -> None:
+    send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
+
+
+def handle_initialize(msg_id, _params) -> None:
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "proton-drive", "version": "2.0.0"},
+            },
+        }
+    )
+
+
+def handle_tools_list(msg_id) -> None:
+    send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
+
+
+def handle_tools_call(msg_id, params: dict, port: int | None) -> None:
+    name = params.get("name", "")
+    arguments = params.get("arguments", {})
+
+    if port is None:
+        error_response(
+            msg_id,
+            -32603,
+            "Proton Drive desktop client is not running. Start it first.",
+        )
+        return
+
+    try:
+        result = http_post(port, "/mcp/tools/call", {"name": name, "arguments": arguments})
+        if "error" in result:
+            error_response(msg_id, result["error"].get("code", -32603), result["error"].get("message", "unknown error"))
+        else:
+            content = result.get("content", [{"type": "text", "text": json.dumps(result)}])
+            send({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content}})
+    except urllib.error.URLError as e:
+        error_response(msg_id, -32603, f"Could not reach Proton Drive client: {e.reason}")
+    except Exception as e:
+        error_response(msg_id, -32603, str(e))
+
+
+def main() -> None:
+    port = find_port()
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg_id = msg.get("id")
+        method = msg.get("method", "")
+        params = msg.get("params") or {}
+
+        if method == "initialize":
+            handle_initialize(msg_id, params)
+        elif method in ("notifications/initialized", "notifications/cancelled"):
+            pass  # notifications — no response
+        elif method == "tools/list":
+            handle_tools_list(msg_id)
+        elif method == "tools/call":
+            handle_tools_call(msg_id, params, port)
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+        elif msg_id is not None:
+            error_response(msg_id, -32601, f"Method not found: {method}")
+
+
+if __name__ == "__main__":
+    main()

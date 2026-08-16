@@ -9,13 +9,23 @@ BRIDGE_FILENAME = "ProtonDriveClaudeBridge.tsx"
 
 BRIDGE_SOURCE = """import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { DeviceType, getDrive } from '@proton/drive';
+
 type TauriCore = {
     invoke<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T>;
 };
+type TauriEvent = {
+    listen<T = unknown>(
+        event: string,
+        handler: (e: { payload: T }) => void
+    ): Promise<() => void>;
+};
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
+type McpToolCall = { id: string; name: string; arguments: Record<string, unknown> };
 
-const getTauri = () => (window as unknown as { __TAURI__?: { core?: TauriCore } }).__TAURI__;
+const getTauri = () =>
+    (window as unknown as { __TAURI__?: { core?: TauriCore; event?: TauriEvent } }).__TAURI__;
 
 const HISTORY_KEY = 'pdl:claude-history';
 
@@ -134,6 +144,45 @@ export const ProtonDriveClaudeBridge = () => {
             setLoading(false);
         }
     }, [input, loading, messages]);
+
+    const handleMcpTool = useCallback(async (name: string, args: Record<string, unknown>): Promise<string> => {
+        if (name === 'list_devices') {
+            const drive = getDrive();
+            const devices: Array<{ name: string; id: string }> = [];
+            for await (const device of drive.iterateDevices(DeviceType.Device)) {
+                devices.push({ name: device.device.name, id: device.device.id });
+            }
+            return JSON.stringify(devices);
+        }
+        if (name === 'get_drive_status') {
+            const tauri = getTauri();
+            const keyOk = tauri?.core
+                ? await tauri.core.invoke<boolean>('claude_get_key_configured').catch(() => false)
+                : false;
+            return JSON.stringify({ running: true, claudeKeyConfigured: keyOk });
+        }
+        throw new Error(`Unknown tool: ${name}`);
+    }, []);
+
+    useEffect(() => {
+        const tauri = getTauri();
+        if (!tauri?.event) return;
+        let unlisten: (() => void) | undefined;
+        void tauri.event
+            .listen<McpToolCall>('mcp://tool-call', async ({ payload }) => {
+                const { id, name, arguments: mcpArgs } = payload;
+                const tauriCore = getTauri()?.core;
+                if (!tauriCore) return;
+                try {
+                    const result = await handleMcpTool(name, mcpArgs);
+                    await tauriCore.invoke('mcp_tool_result', { id, result });
+                } catch (e) {
+                    await tauriCore.invoke('mcp_tool_result', { id, error: String(e) });
+                }
+            })
+            .then((u) => { unlisten = u; });
+        return () => { unlisten?.(); };
+    }, [handleMcpTool]);
 
     return (
         <>
@@ -359,6 +408,41 @@ export const ProtonDriveClaudeBridge = () => {
                             Loading…
                         </div>
                     )}
+
+                    {/* Claude Desktop MCP */}
+                    <div
+                        style={{
+                            padding: '12px 16px',
+                            borderTop: '1px solid var(--border-norm, #2d2b45)',
+                            fontSize: 11,
+                            color: 'var(--text-weak, #888)',
+                        }}
+                    >
+                        <p style={{ margin: '0 0 6px', fontWeight: 600, color: 'var(--text-norm, #ccc)' }}>
+                            Claude Desktop (MCP)
+                        </p>
+                        <p style={{ margin: '0 0 6px' }}>
+                            Add to <code>claude_desktop_config.json</code>:
+                        </p>
+                        <pre
+                            style={{
+                                margin: 0,
+                                padding: '6px 8px',
+                                background: 'var(--background-strong, #2a2840)',
+                                borderRadius: 4,
+                                overflowX: 'auto',
+                                fontSize: 10,
+                                color: 'var(--text-norm, #e2e0ff)',
+                                lineHeight: 1.4,
+                            }}
+                        >{`{
+  "mcpServers": {
+    "proton-drive": {
+      "command": "/usr/local/bin/proton-drive-mcp"
+    }
+  }
+}`}</pre>
+                    </div>
                 </div>
             )}
         </>
