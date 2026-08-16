@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::{extract::State, routing::{get, post}, Json, Router};
-use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use serde::Deserialize;
+use tauri::{AppHandle, Emitter};
 
 static CALL_ID: AtomicU64 = AtomicU64::new(1);
 

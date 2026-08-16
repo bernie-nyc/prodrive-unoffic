@@ -202,7 +202,7 @@ fn mcp_tool_result(
 
 /// Returns the localhost port the MCP server is listening on, or null if not running.
 #[tauri::command]
-fn get_mcp_port(state: tauri::State<'_, McpState>) -> Option<u16> {
+fn get_mcp_port(_state: tauri::State<'_, McpState>) -> Option<u16> {
     let port_file = std::env::temp_dir().join("proton-drive-mcp.port");
     std::fs::read_to_string(port_file)
         .ok()
