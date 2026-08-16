@@ -18,6 +18,8 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod claude;
 use claude::{claude_chat, claude_clear_api_key, claude_get_key_configured, claude_set_api_key};
+mod mcp_server;
+use mcp_server::PendingCalls;
 
 /// Live sync module — monitors local filesystem changes and syncs with Proton Drive.
 mod live_sync;
@@ -55,6 +57,11 @@ struct AppState {
     client: Client,
     cookie_jar: Arc<Jar>,
     sync_manager: live_sync::LiveSyncManager,
+}
+
+/// State for the embedded MCP server — tracks in-flight tool calls.
+struct McpState {
+    pending: PendingCalls,
 }
 
 /// An HTTP request to proxy through the Tauri backend to Proton.
@@ -172,6 +179,34 @@ async fn navigate_to_captcha(
 #[tauri::command]
 fn get_captcha_return_url() -> Option<String> {
     CAPTCHA_RETURN_URL.lock().unwrap().take()
+}
+
+/// Called by the WebView when it finishes handling an MCP tool call.
+#[tauri::command]
+fn mcp_tool_result(
+    state: tauri::State<'_, McpState>,
+    id: String,
+    result: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    if let Some(tx) = state.pending.lock().unwrap().remove(&id) {
+        let outcome = match (result, error) {
+            (Some(r), _) => Ok(r),
+            (_, Some(e)) => Err(e),
+            _ => Err("no result or error from WebView".to_string()),
+        };
+        let _ = tx.send(outcome);
+    }
+    Ok(())
+}
+
+/// Returns the localhost port the MCP server is listening on, or null if not running.
+#[tauri::command]
+fn get_mcp_port(_state: tauri::State<'_, McpState>) -> Option<u16> {
+    let port_file = std::env::temp_dir().join("proton-drive-mcp.port");
+    std::fs::read_to_string(port_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// Saves a downloaded file (blob) to the user's Downloads folder.
@@ -781,8 +816,11 @@ fn main() {
 
     let startup_sync_state = Arc::clone(&state);
 
+    let mcp_pending: PendingCalls = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     tauri::Builder::default()
         .manage(state)
+        .manage(McpState { pending: mcp_pending.clone() })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -1847,6 +1885,11 @@ fn main() {
                 }
             }
 
+            // Start the MCP HTTP server for Claude Desktop integration.
+            let mcp_app = app.handle().clone();
+            let mcp_pending_start = app.state::<McpState>().pending.clone();
+            tokio::spawn(mcp_server::start(mcp_app, mcp_pending_start));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1877,7 +1920,10 @@ fn main() {
             claude_set_api_key,
             claude_get_key_configured,
             claude_clear_api_key,
-            claude_chat
+            claude_chat,
+            // MCP server (Claude Desktop integration)
+            mcp_tool_result,
+            get_mcp_port
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
