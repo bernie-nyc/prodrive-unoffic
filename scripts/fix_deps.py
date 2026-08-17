@@ -15,10 +15,16 @@ inaccessible from CI/build environments. This script performs several fixups:
    --api flag (Tauri IPC handles API calls). Adds --no-sri because WebKitGTK
    rejects script integrity attributes on the tauri:// protocol.
 
-3. DISABLE SRI FOR ACCOUNT/VERIFY — Same WebKitGTK tauri:// SRI rejection affects
-   the account and verify apps; adds --no-sri to their build:web scripts.
+3. PATCH ACCOUNT BUILD — Sets --api=/api so the account app uses relative API
+   paths instead of a hardcoded absolute Proton domain.  Without this, SSO-mode
+   builds use https://api.proton.me as the base, which omits /api/ from the path
+   and bypasses the fetch proxy, causing "cannot fetch server time" at login.
+   Also adds --no-sri (same WebKitGTK tauri:// SRI rejection as drive).
 
-4. CONFIGURE YARN — Removes npmScopes and npmRegistries sections (internal Proton
+4. DISABLE SRI FOR VERIFY — Same WebKitGTK tauri:// SRI rejection; adds
+   --no-sri to the verify app's build:web script.
+
+5. CONFIGURE YARN — Removes npmScopes and npmRegistries sections (internal Proton
    registries unreachable from CI), overrides npmRegistryServer to the public
    registry, and disables immutable installs for CI compatibility.
 
@@ -92,9 +98,40 @@ if drive_pkg_path.exists():
 else:
     print("  Warning: Could not find drive package.json")
 
-# Disable SRI for account and verify apps (same WebKitGTK tauri:// SRI rejection issue)
+# Patch account app: force relative API paths and disable SRI.
+# Without --api=/api the account app in SSO mode hard-codes an absolute Proton
+# API base URL (e.g. https://api.proton.me).  Requests to that domain omit the
+# /api/ path prefix, so the fetch proxy's url.includes('/api/') guard misses
+# them — they fall through to native WebKit fetch which fails with CORS and
+# surfaces as "cannot fetch server time" in the SRP login flow.
+# Setting --api=/api forces relative paths that the proxy always catches.
+print("\nPatching Proton Account build configuration...")
+account_pkg_path = Path('WebClients/applications/account/package.json')
+if account_pkg_path.exists():
+    account_data = json.loads(account_pkg_path.read_text())
+    if 'scripts' in account_data and 'build:web' in account_data['scripts']:
+        old_script = account_data['scripts']['build:web']
+        new_script = old_script
+        # Remove any existing --api flag before we set our own
+        new_script = re.sub(r'\s*--api=\S+', '', new_script)
+        # Force relative API paths so all calls go through the Tauri IPC proxy
+        if '--api=/api' not in new_script:
+            new_script = new_script.rstrip() + ' --api=/api'
+        if '--no-sri' not in new_script:
+            new_script = new_script.rstrip() + ' --no-sri'
+        if old_script != new_script:
+            account_data['scripts']['build:web'] = new_script
+            account_pkg_path.write_text(json.dumps(account_data, indent=4) + '\n')
+            print("  Set --api=/api (relative paths) and disabled SRI for account app")
+        else:
+            print("  account app already configured correctly")
+    else:
+        print("  Warning: Could not find build:web script in account package.json")
+else:
+    print("  Warning: Could not find account package.json")
+
+# Disable SRI for verify app (same WebKitGTK tauri:// SRI rejection issue)
 for app_name, app_pkg_path in [
-    ('account', Path('WebClients/applications/account/package.json')),
     ('verify', Path('WebClients/applications/verify/package.json')),
 ]:
     if app_pkg_path.exists():

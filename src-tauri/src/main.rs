@@ -1396,8 +1396,14 @@ fn main() {
         // + 5 PROXY_REQ logs = 15 concurrent invokes, vs ~5 on main).
         // Rust already logs [Proxy][N] for proxied requests.
 
-        // Only proxy API calls
-        if (!url.includes('/api/')) {
+        // Proxy API calls. Match both /api/ path-prefixed calls (the common case
+        // when --api=/api is set) and direct Proton API domain calls where the
+        // domain IS the api host, making /api/ absent from the path
+        // (e.g. https://api.proton.me/core/v4/tests/time).
+        const isProtonApiCall = url.includes('/api/')
+            || /^https?:\/\/api\.proton\.me\//.test(url)
+            || /^https?:\/\/account\.proton\.me\/(?!assets\/|account\/assets\/)/.test(url);
+        if (!isProtonApiCall) {
             // For fetch calls, if we've fixed the URL from // to /, update the input
             let fetchInput = input;
             if (typeof input === 'string' && input !== url) {
