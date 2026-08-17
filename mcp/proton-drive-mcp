@@ -24,15 +24,11 @@ Requirements: Python 3.8+, no third-party packages.
 """
 
 import json
-import platform
 import sys
-import tempfile
-import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
-PORT_FILE = Path(tempfile.gettempdir()) / "proton-drive-mcp.port"
+FIXED_PORT = 37242
 
 TOOLS = [
     {
@@ -54,24 +50,10 @@ TOOLS = [
 ]
 
 
-def find_port(timeout: float = 5.0) -> int | None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            text = PORT_FILE.read_text().strip()
-            port = int(text)
-            if port > 0:
-                return port
-        except (OSError, ValueError):
-            pass
-        time.sleep(0.2)
-    return None
-
-
-def http_post(port: int, path: str, body: dict) -> dict:
+def http_post(path: str, body: dict) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
+        f"http://127.0.0.1:{FIXED_PORT}{path}",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -107,34 +89,23 @@ def handle_tools_list(msg_id) -> None:
     send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
 
 
-def handle_tools_call(msg_id, params: dict, port: int | None) -> None:
+def handle_tools_call(msg_id, params: dict) -> None:
     name = params.get("name", "")
     arguments = params.get("arguments", {})
-
-    if port is None:
-        error_response(
-            msg_id,
-            -32603,
-            "Proton Drive desktop client is not running. Start it first.",
-        )
-        return
-
     try:
-        result = http_post(port, "/mcp/tools/call", {"name": name, "arguments": arguments})
+        result = http_post("/mcp/tools/call", {"name": name, "arguments": arguments})
         if "error" in result:
             error_response(msg_id, result["error"].get("code", -32603), result["error"].get("message", "unknown error"))
         else:
             content = result.get("content", [{"type": "text", "text": json.dumps(result)}])
             send({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content}})
     except urllib.error.URLError as e:
-        error_response(msg_id, -32603, f"Could not reach Proton Drive client: {e.reason}")
+        error_response(msg_id, -32603, f"Proton Drive not running (port {FIXED_PORT}): {e.reason}")
     except Exception as e:
         error_response(msg_id, -32603, str(e))
 
 
 def main() -> None:
-    port = find_port()
-
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -155,7 +126,7 @@ def main() -> None:
         elif method == "tools/list":
             handle_tools_list(msg_id)
         elif method == "tools/call":
-            handle_tools_call(msg_id, params, port)
+            handle_tools_call(msg_id, params)
         elif method == "ping":
             send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
         elif msg_id is not None:
