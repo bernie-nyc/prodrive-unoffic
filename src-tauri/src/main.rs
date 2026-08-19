@@ -1894,7 +1894,7 @@ fn main() {
             // Start the MCP HTTP server for Claude Desktop integration.
             let mcp_app = app.handle().clone();
             let mcp_pending_start = app.state::<McpState>().pending.clone();
-            tokio::spawn(mcp_server::start(mcp_app, mcp_pending_start));
+            tauri::async_runtime::spawn(mcp_server::start(mcp_app, mcp_pending_start));
 
             Ok(())
         })
