@@ -1840,8 +1840,9 @@ fn main() {
                     }
 
                     // Allow tauri://, about: URLs but BLOCK /api/ navigation (API calls should use fetch, not navigate)
-                    // Blocking /api/ prevents iframes from trying to load API endpoints which breaks the account app
-                    if url.path().starts_with("/api/") {
+                    // Blocking /api/ prevents iframes from trying to load API endpoints which breaks the account app.
+                    // Exception: /api/challenge/ returns HTML for Proton's anti-abuse iframe and must navigate.
+                    if url.path().starts_with("/api/") && !url.path().starts_with("/api/challenge/") {
                         println!("[Navigation] Blocking API navigation (should use fetch): {}", url_str);
                         return false;
                     }
