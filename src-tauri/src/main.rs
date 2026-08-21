@@ -923,6 +923,10 @@ fn main() {
     {}
 "#, worker_init) + r#"
 
+    // Idempotency: safe to re-inject via on_page_load without double-installing
+    if (window.__pdProxyInstalled) return;
+    window.__pdProxyInstalled = true;
+
     // Regression guard for post-2FA Drive load:
     // The Tauri asset protocol must load Drive at tauri://localhost/, but the
     // Drive SPA needs a /u/<localID>/ route when a persisted ps-<localID>
@@ -1046,7 +1050,9 @@ fn main() {
             console.log('[Download] Saving:', filename, 'size:', blob.size);
             const buffer = await blob.arrayBuffer();
             const bytes = Array.from(new Uint8Array(buffer));
-            const path = await window.__TAURI__.core.invoke('save_download', {
+            const _invSD = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+            if (!_invSD) throw new Error('Tauri IPC unavailable for download');
+            const path = await _invSD.call(window, 'save_download', {
                 filename: filename,
                 data: bytes
             });
@@ -1192,7 +1198,9 @@ fn main() {
                 try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
                 catch { return String(a); }
             }).join(' ');
-            window.__TAURI__?.core?.invoke('js_log', { msg });
+            // Use __TAURI__ if available (withGlobalTauri), else fall back to internal bridge
+            (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+                ?.call(window, 'js_log', { msg });
         } catch {}
     };
 
@@ -1375,7 +1383,14 @@ fn main() {
     function invokeProxyRequest(payload) {
         const next = proxyInvokeChain
             .catch(() => null)
-            .then(() => window.__TAURI__.core.invoke('proxy_request', payload));
+            .then(() => {
+                // Prefer withGlobalTauri API; fall back to internal bridge which is
+                // always injected by WRY's core regardless of withGlobalTauri setting.
+                const invoke = window.__TAURI__?.core?.invoke
+                    ?? window.__TAURI_INTERNALS__?.invoke;
+                if (!invoke) return Promise.reject(new Error('Tauri IPC unavailable'));
+                return invoke.call(window, 'proxy_request', payload);
+            });
         proxyInvokeChain = next.catch(() => null);
         return next;
     }
@@ -1465,7 +1480,8 @@ fn main() {
             // Check for pending verification token (for auth retry after captcha)
             // Must match /api/core/v4/auth exactly, NOT /auth/cookies or /auth/info
             if (url.includes('/api/core/v4/auth') && !url.includes('/auth/cookies') && !url.includes('/auth/info')) {
-                const verification = await window.__TAURI__.core.invoke('get_and_clear_verification_token');
+                const _inv = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                const verification = _inv ? await _inv.call(window, 'get_and_clear_verification_token') : null;
                 if (verification) {
                     console.log('[CAPTCHA] Adding verification headers to auth request');
                     cleanHeaders['x-pm-human-verification-token'] = verification[0];
@@ -1503,7 +1519,8 @@ fn main() {
                             const passInput = document.querySelector('input[name="password"], input[type="password"]');
                             if (emailInput?.value && passInput?.value) {
                                 console.log('[CAPTCHA] Saving login credentials for after captcha');
-                                await window.__TAURI__.core.invoke('store_login_credentials', {
+                                const _invSLC = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                                if (_invSLC) await _invSLC.call(window, 'store_login_credentials', {
                                     username: emailInput.value,
                                     password: passInput.value
                                 });
@@ -1514,10 +1531,11 @@ fn main() {
 
                         // Navigate to REAL verify page as top-level document
                         // This is the ONLY way hCaptcha works in WebKitGTK
-                        window.__TAURI__.core.invoke('navigate_to_captcha', {
+                        const _invNC = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                        if (_invNC) _invNC.call(window, 'navigate_to_captcha', {
                             captchaUrl: captchaUrl,
                             returnUrl: window.location.href
-                        }).catch(err => {
+                        })?.catch?.(err => {
                             console.error('[CAPTCHA] Failed to navigate:', err);
                             captchaPending = false;
                         });
@@ -1622,7 +1640,7 @@ fn main() {
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(800.0, 600.0)
                 .data_directory(webview_data_dir)
-                .initialization_script(init_script)
+                .initialization_script(init_script.clone())
                 .devtools(true)  // Enable right-click -> Inspect
                 .on_download(|_webview, event| {
                     use tauri::webview::DownloadEvent;
@@ -1666,7 +1684,9 @@ fn main() {
                                         console.log('[Download] Saving blob:', filename, 'size:', blob.size);
                                         const buffer = await blob.arrayBuffer();
                                         const bytes = Array.from(new Uint8Array(buffer));
-                                        const path = await window.__TAURI__.core.invoke('save_download', {{
+                                        const _invBD = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                                        if (!_invBD) throw new Error('Tauri IPC unavailable for blob download');
+                                        const path = await _invBD.call(window, 'save_download', {{
                                             filename: filename,
                                             data: bytes
                                         }});
@@ -1854,6 +1874,25 @@ fn main() {
                         || url.scheme() == "about"
                         || url.host_str() == Some("localhost")
                         || url.host_str() == Some("tauri.localhost")
+                })
+                .on_page_load({
+                    // Belt-and-suspenders: re-inject the proxy script on account page loads.
+                    // initialization_script fires at document_start, but on some WebKitGTK
+                    // versions a same-origin navigate() call can reuse the document without
+                    // re-firing user scripts. Re-evaluting on PageLoadEvent::Started with
+                    // the idempotency guard (window.__pdProxyInstalled) makes it a no-op
+                    // if the script is already installed.
+                    let page_load_script = init_script.clone();
+                    move |webview, payload| {
+                        use tauri::webview::PageLoadEvent;
+                        if payload.event() == PageLoadEvent::Started {
+                            let path = payload.url().path().to_string();
+                            if path.starts_with("/account") || path.starts_with("/verify") {
+                                println!("[PageLoad] Re-injecting proxy for: {}", path);
+                                let _ = webview.eval(&page_load_script);
+                            }
+                        }
+                    }
                 })
                 .build()?;
 
