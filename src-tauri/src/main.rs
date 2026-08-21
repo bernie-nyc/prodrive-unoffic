@@ -1396,6 +1396,10 @@ fn main() {
         // + 5 PROXY_REQ logs = 15 concurrent invokes, vs ~5 on main).
         // Rust already logs [Proxy][N] for proxied requests.
 
+        // Temporary fetch diagnostics: log every URL so we can see what the account
+        // app fetches and whether the proxy intercepts it correctly.
+        console.log('[FETCH]', (init.method || 'GET').toUpperCase(), url);
+
         // Proxy API calls. Match both /api/ path-prefixed calls (the common case
         // when --api=/api is set) and direct Proton API domain calls where the
         // domain IS the api host, making /api/ absent from the path
