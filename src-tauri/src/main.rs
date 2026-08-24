@@ -1885,12 +1885,29 @@ fn main() {
                     let page_load_script = init_script.clone();
                     move |webview, payload| {
                         use tauri::webview::PageLoadEvent;
+                        let event_label = match payload.event() {
+                            PageLoadEvent::Started => "Started",
+                            PageLoadEvent::Finished => "Finished",
+                            _ => "Unknown",
+                        };
+                        println!("[PageLoad] {} {}", event_label, payload.url());
                         if payload.event() == PageLoadEvent::Started {
                             let path = payload.url().path().to_string();
                             if path.starts_with("/account") || path.starts_with("/verify") {
                                 println!("[PageLoad] Re-injecting proxy for: {}", path);
                                 let _ = webview.eval(&page_load_script);
                             }
+                            // IPC availability diagnostic — runs after proxy re-injection so
+                            // console.log override is in place when sendToRust fires.
+                            let _ = webview.eval(r#"
+                                (function() {
+                                    var hasTauri = typeof window.__TAURI__?.core?.invoke === 'function';
+                                    var hasInternals = typeof window.__TAURI_INTERNALS__?.invoke === 'function';
+                                    var hasIpc = typeof window.ipc?.postMessage === 'function';
+                                    var installed = !!window.__pdProxyInstalled;
+                                    console.log('[IPC-diag] __TAURI__=' + hasTauri + ' __TAURI_INTERNALS__=' + hasInternals + ' ipc=' + hasIpc + ' proxyInstalled=' + installed);
+                                })();
+                            "#);
                         }
                     }
                 })
