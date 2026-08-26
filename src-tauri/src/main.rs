@@ -1405,15 +1405,13 @@ fn main() {
             console.log('[FETCH] Fixed protocol-relative URL to:', url);
         }
 
-        // Note: FETCH-level logging removed from hot path.
-        // Each js_log invoke adds IPC pressure that can break the WebKitGTK
-        // IPC bridge under concurrent load (5 SPA fetches + 5 FETCH logs
-        // + 5 PROXY_REQ logs = 15 concurrent invokes, vs ~5 on main).
-        // Rust already logs [Proxy][N] for proxied requests.
-
-        // Temporary fetch diagnostics: log every URL so we can see what the account
-        // app fetches and whether the proxy intercepts it correctly.
-        console.log('[FETCH]', (init.method || 'GET').toUpperCase(), url);
+        // FETCH-level logging intentionally absent: each js_log IPC call goes via
+        // fetch('ipc://...'), which our override intercepts again. Logging here
+        // creates: sendToRust → invoke(js_log) → fetch(ipc://js_log) → this
+        // override → sendToRust → ... (infinite recursion).
+        // Saturating the bridge causes customProtocolIpcFailed=true and fallback to
+        // window.ipc.postMessage, which has a Tauri bug where JSON object responses
+        // (like ProxyResponse) never resolve. Rust logs [Proxy][N] for proxied calls.
 
         // Proxy API calls. Match both /api/ path-prefixed calls (the common case
         // when --api=/api is set) and direct Proton API domain calls where the
