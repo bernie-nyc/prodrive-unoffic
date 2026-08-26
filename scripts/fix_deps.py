@@ -200,3 +200,42 @@ if 'enableImmutableInstalls' not in yarnrc_content:
 
 yarnrc_path.write_text(yarnrc_content)
 print("✅ Yarn configured with public npm registry")
+
+# Stub removed @proton/components exports.
+# DrawerAppButton was removed from @proton/components upstream.
+# Rather than patching the barrel (whose path changes across WebClients versions),
+# we patch the Drive app's DriveWindow.tsx to define a local no-op stub and
+# remove the now-missing import so the webpack build doesn't fail.
+print("\nPatching removed @proton/components exports...")
+drive_window_path = Path('WebClients/applications/drive/src/app/legacy/components/layout/DriveWindow.tsx')
+if drive_window_path.exists():
+    content = drive_window_path.read_text()
+    if 'DrawerAppButton' in content:
+        import re as _re
+
+        # 1. Remove DrawerAppButton from any { ..., DrawerAppButton, ... } import line
+        content = _re.sub(r',\s*DrawerAppButton\b', '', content)
+        content = _re.sub(r'\bDrawerAppButton\s*,', '', content)
+        # Handle the case where it's the only import in the braces
+        content = _re.sub(r'\{\s*DrawerAppButton\s*\}', '{}', content)
+
+        # 2. Add a local stub after the last import in the file so any remaining
+        #    JSX references compile.  If there are no remaining references the
+        #    stub is harmless.
+        last_import_match = None
+        for m in _re.finditer(r'^import .+$', content, _re.MULTILINE):
+            last_import_match = m
+        stub_component = (
+            "\n// Compatibility stub — DrawerAppButton removed from @proton/components\n"
+            "const DrawerAppButton: React.FC<Record<string, unknown>> = () => null;\n"
+        )
+        if last_import_match and 'const DrawerAppButton' not in content:
+            insert_pos = last_import_match.end()
+            content = content[:insert_pos] + stub_component + content[insert_pos:]
+
+        drive_window_path.write_text(content)
+        print("  Patched DriveWindow.tsx: removed DrawerAppButton import, added no-op stub")
+    else:
+        print("  DriveWindow.tsx: DrawerAppButton not present (already clean)")
+else:
+    print("  DriveWindow.tsx not found — skipping DrawerAppButton patch")
