@@ -1723,70 +1723,6 @@ fn main() {
         }
     }, true);
 
-    // Intercept ALL iframe src assignments to route challenge frames via pdchallenge://.
-    // Proton's anti-abuse system creates iframes with src="/api/challenge/v4/html?...".
-    // Instance-level createElement hooking missed frames created via innerHTML/cloneNode/React.
-    // Prototype-level overrides + MutationObserver catch every possible code path.
-    (function() {
-        function rewriteChallengeSrc(v) {
-            if (typeof v !== 'string' || !v.includes('/api/challenge/')) return null;
-            var path = v.replace(/^tauri:\/\/localhost/, '');
-            if (!path.startsWith('/')) path = '/' + path;
-            return 'pdchallenge://challenge' + path;
-        }
-
-        // 1. HTMLIFrameElement.prototype.src setter — catches iframe.src = '...'
-        var iframeSrcDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src');
-        if (iframeSrcDesc && iframeSrcDesc.set) {
-            var _origIframeSrcSet = iframeSrcDesc.set;
-            Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
-                configurable: true,
-                enumerable: true,
-                get: iframeSrcDesc.get,
-                set: function(v) {
-                    var rw = rewriteChallengeSrc(v);
-                    _origIframeSrcSet.call(this, rw !== null ? rw : v);
-                }
-            });
-        }
-
-        // 2. Element.prototype.setAttribute — catches iframe.setAttribute('src', '...')
-        var _origSetAttr = Element.prototype.setAttribute;
-        Element.prototype.setAttribute = function(name, value) {
-            if (name === 'src' && this.tagName === 'IFRAME') {
-                var rw = rewriteChallengeSrc(value);
-                _origSetAttr.call(this, 'src', rw !== null ? rw : value);
-            } else {
-                _origSetAttr.call(this, name, value);
-            }
-        };
-
-        // 3. MutationObserver — belt-and-suspenders for innerHTML / parser / C++ paths.
-        //    Fires synchronously after the attribute mutation but before WebKit starts
-        //    the frame navigation task, so rewriting in time is valid per the HTML spec.
-        try {
-            var _obs = new MutationObserver(function(mutations) {
-                for (var i = 0; i < mutations.length; i++) {
-                    var m = mutations[i];
-                    if (m.type === 'attributes' && m.attributeName === 'src' &&
-                            m.target && m.target.tagName === 'IFRAME') {
-                        var src = m.target.getAttribute('src');
-                        var rw = rewriteChallengeSrc(src);
-                        if (rw !== null) {
-                            _origSetAttr.call(m.target, 'src', rw);
-                        }
-                    }
-                }
-            });
-            _obs.observe(document.documentElement, {
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['src']
-            });
-        } catch(e) {}
-
-        console.log('[Tauri] Challenge iframe intercept installed (prototype+observer)');
-    })();
 })();
 "#;
 
@@ -2024,6 +1960,46 @@ fn main() {
                     if url.scheme() == "pdchallenge" {
                         println!("[Navigation] Allowing challenge frame: {}", url_str);
                         return true;
+                    }
+
+                    // Challenge iframes: on_navigation fires for tauri://localhost/api/challenge/...
+                    // because WebKit resolves the relative src before any JS can intercept it.
+                    // Block the navigation, then redirect the iframe to pdchallenge:// via eval —
+                    // our custom protocol handler proxies the real challenge HTML from Proton.
+                    if url.scheme() == "tauri"
+                        && url.host_str() == Some("localhost")
+                        && url.path().starts_with("/api/challenge/")
+                    {
+                        let pdc_url = format!(
+                            "pdchallenge://challenge{}{}",
+                            url.path(),
+                            url.query().map(|q| format!("?{}", q)).unwrap_or_default()
+                        );
+                        println!("[Challenge] Redirecting blocked iframe to: {}", pdc_url);
+                        if let Some(window) = app_handle_nav.get_webview_window("main") {
+                            let pdc = pdc_url.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let pdc_js = serde_json::to_string(&pdc)
+                                    .unwrap_or_else(|_| format!("\"{}\"", pdc));
+                                let js = format!(
+                                    r#"(function(){{
+                                        var pdc = {pdc_js};
+                                        var frames = document.querySelectorAll('iframe');
+                                        for (var i = 0; i < frames.length; i++) {{
+                                            var s = frames[i].getAttribute('src') || '';
+                                            if (s.includes('/api/challenge/')) {{
+                                                frames[i].setAttribute('src', pdc);
+                                                console.log('[Challenge] iframe', i, 'redirected to pdchallenge://');
+                                                break;
+                                            }}
+                                        }}
+                                    }})();"#,
+                                    pdc_js = pdc_js
+                                );
+                                let _ = window.eval(&js);
+                            });
+                        }
+                        return false;
                     }
 
                     // Allow tauri://, about: URLs but BLOCK /api/ navigation (API calls should use fetch, not navigate)
