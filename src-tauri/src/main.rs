@@ -824,6 +824,99 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Custom scheme that proxies Proton's anti-abuse challenge HTML into WebKit iframes.
+        // The JS init script rewrites challenge iframe srcs from /api/challenge/... to
+        // pdchallenge://challenge/api/challenge/... so navigation is allowed and this handler
+        // serves the real content fetched from account.proton.me.
+        .register_uri_scheme_protocol("pdchallenge", |_app, request| {
+            use tauri::http::Response;
+            let uri = request.uri();
+            let path = uri.path();
+            let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+            let real_url = format!("https://account.proton.me{}{}", path, query);
+            println!("[Challenge] Proxying: {}", real_url);
+
+            let make_error = |code: u16, msg: &str| -> Response<Vec<u8>> {
+                Response::builder()
+                    .status(code)
+                    .header("Content-Type", "text/plain")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(msg.as_bytes().to_vec())
+                    .unwrap_or_else(|_| Response::new(vec![]))
+            };
+
+            let client = match reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[Challenge] Client build error: {}", e);
+                    return make_error(500, "client build failed");
+                }
+            };
+
+            let resp = match client.get(&real_url)
+                .header("Origin", "https://account.proton.me")
+                .header("Referer", "https://account.proton.me/")
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[Challenge] Request error: {}", e);
+                    return make_error(502, "upstream request failed");
+                }
+            };
+
+            let status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/html")
+                .to_string();
+
+            let body_bytes = match resp.bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[Challenge] Body read error: {}", e);
+                    return make_error(502, "body read failed");
+                }
+            };
+
+            // For HTML responses inject a base href so relative subresource URLs in the
+            // challenge frame resolve back through our pdchallenge:// handler.
+            let final_body: Vec<u8> = if content_type.contains("html") {
+                let html = String::from_utf8_lossy(&body_bytes);
+                let base_tag = r#"<base href="pdchallenge://challenge/">"#;
+                if html.contains("<head>") {
+                    html.replacen("<head>", &format!("<head>{}", base_tag), 1)
+                        .into_bytes()
+                } else if let Some(idx) = html.to_lowercase().find("<head") {
+                    // Find end of opening <head ...> tag
+                    if let Some(end) = html[idx..].find('>') {
+                        let insert_at = idx + end + 1;
+                        let mut s = html.into_owned();
+                        s.insert_str(insert_at, base_tag);
+                        s.into_bytes()
+                    } else {
+                        format!("{}{}", base_tag, html).into_bytes()
+                    }
+                } else {
+                    format!("{}{}", base_tag, html).into_bytes()
+                }
+            } else {
+                body_bytes.to_vec()
+            };
+
+            Response::builder()
+                .status(status)
+                .header("Content-Type", content_type)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(final_body)
+                .unwrap_or_else(|_| Response::new(vec![]))
+        })
         .setup(move |app| {
             let webview_data_dir = persistent_webview_data_dir(app.path().app_data_dir()?);
             ensure_webview_data_dir(&webview_data_dir)?;
@@ -1629,6 +1722,55 @@ fn main() {
             }
         }
     }, true);
+
+    // Intercept challenge iframe src to route via pdchallenge:// custom protocol.
+    // Proton's anti-abuse system creates iframes with src="/api/challenge/v4/html?...".
+    // Those navigate to tauri://localhost/api/... which has no bundled file → 404 → challenge
+    // fails → login blocked. We rewrite the src so the iframe loads via our Rust handler
+    // which proxies the real challenge HTML from account.proton.me. The challenge JS
+    // runs locally, sends its token via postMessage, and login can complete.
+    (function() {
+        var _origCreate = document.createElement.bind(document);
+        document.createElement = function(tag) {
+            var el = _origCreate.apply(document, arguments);
+            if (typeof tag === 'string' && tag.toLowerCase() === 'iframe') {
+                var _origSetAttr = el.setAttribute.bind(el);
+                var _srcProto = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src');
+                function rewriteIfChallenge(v) {
+                    if (typeof v === 'string' && v.includes('/api/challenge/')) {
+                        // /api/challenge/v4/html?... → pdchallenge://challenge/api/challenge/v4/html?...
+                        var path = v.replace(/^tauri:\/\/localhost/, '');
+                        path = path.startsWith('/') ? path : '/' + path;
+                        return 'pdchallenge://challenge' + path;
+                    }
+                    return null;
+                }
+                Object.defineProperty(el, 'src', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function() {
+                        return _srcProto ? _srcProto.get.call(el) : (el.getAttribute('src') || '');
+                    },
+                    set: function(v) {
+                        var rw = rewriteIfChallenge(v);
+                        var target = rw !== null ? rw : v;
+                        if (_srcProto) { _srcProto.set.call(el, target); }
+                        else { _origSetAttr('src', target); }
+                    }
+                });
+                el.setAttribute = function(name, value) {
+                    if (name === 'src') {
+                        var rw = rewriteIfChallenge(value);
+                        _origSetAttr('src', rw !== null ? rw : value);
+                    } else {
+                        _origSetAttr(name, value);
+                    }
+                };
+            }
+            return el;
+        };
+        console.log('[Tauri] Challenge iframe intercept installed');
+    })();
 })();
 "#;
 
@@ -1861,6 +2003,13 @@ fn main() {
                         return false;
                     }
 
+                    // Allow pdchallenge:// — our custom scheme that proxies Proton's
+                    // anti-abuse challenge HTML so iframes load correctly.
+                    if url.scheme() == "pdchallenge" {
+                        println!("[Navigation] Allowing challenge frame: {}", url_str);
+                        return true;
+                    }
+
                     // Allow tauri://, about: URLs but BLOCK /api/ navigation (API calls should use fetch, not navigate)
                     // Blocking /api/ prevents iframes from trying to load API endpoints which breaks the account app
                     if url.path().starts_with("/api/") {
@@ -1870,6 +2019,7 @@ fn main() {
 
                     url.scheme() == "tauri"
                         || url.scheme() == "about"
+                        || url.scheme() == "pdchallenge"
                         || url.host_str() == Some("localhost")
                         || url.host_str() == Some("tauri.localhost")
                 })
