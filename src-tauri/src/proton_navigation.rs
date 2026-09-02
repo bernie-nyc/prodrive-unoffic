@@ -69,6 +69,17 @@ pub fn captcha_completion_token(url: &tauri::Url) -> Option<(String, String)> {
     }
 }
 
+/// True for Proton's anti-abuse challenge frames when they resolve against the
+/// local app origin (`tauri://localhost/api/challenge/...`).
+///
+/// These are the only `/api/` paths the WebView may navigate to: the
+/// `on_web_resource_request` handler serves the real challenge HTML for them.
+pub fn is_challenge_frame_url(url: &tauri::Url) -> bool {
+    url.scheme() == "tauri"
+        && is_local_app_host(url.host_str())
+        && url.path().starts_with("/api/challenge/")
+}
+
 fn is_unsupported_proton_app_host(host: &str) -> bool {
     matches!(
         host,
@@ -167,6 +178,20 @@ mod tests {
     fn rejects_account_return_without_captcha_token() {
         let url = tauri::Url::parse("tauri://localhost/account/").unwrap();
         assert_eq!(captcha_completion_token(&url), None);
+    }
+
+    #[test]
+    fn allows_local_challenge_frames_only() {
+        let challenge = tauri::Url::parse(
+            "tauri://localhost/api/challenge/v4/html?Type=0&Name=login&Lang=en-US&Dir=ltr",
+        )
+        .unwrap();
+        let other_api = tauri::Url::parse("tauri://localhost/api/core/v4/auth/info").unwrap();
+        let remote = tauri::Url::parse("https://account.proton.me/api/challenge/v4/html").unwrap();
+
+        assert!(is_challenge_frame_url(&challenge));
+        assert!(!is_challenge_frame_url(&other_api));
+        assert!(!is_challenge_frame_url(&remote));
     }
 
     #[test]

@@ -19,6 +19,10 @@ runs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Check embedded WebView init script syntax
+      shell: bash
+      run: bash scripts/ci/check-init-script-syntax.sh
+
     - name: Install Rust
       shell: bash
       run: |

@@ -30,7 +30,8 @@ mod webview_cookies;
 mod webview_storage;
 
 use proton_navigation::{
-    account_login_complete_redirect_url, captcha_completion_token, unsupported_app_redirect_url,
+    account_login_complete_redirect_url, captcha_completion_token, is_challenge_frame_url,
+    unsupported_app_redirect_url,
 };
 use url_log::sanitize_url_for_log;
 use webview_cookies::{combined_cookie_header, store_webview_cookie};
@@ -38,6 +39,10 @@ use webview_storage::{ensure_webview_data_dir, persistent_webview_data_dir};
 
 /// Base URL for the Proton API.
 const PROTON_API_BASE: &str = "https://mail.proton.me";
+/// Origin that serves Proton's anti-abuse challenge frames (`/api/challenge/...`).
+const CHALLENGE_UPSTREAM_ORIGIN: &str = "https://account.proton.me";
+const CHALLENGE_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// Error message shown when a sync command is invoked from an untrusted origin.
 const ERR_SYNC_NOT_ALLOWED: &str = "Sync operation is not allowed in this context";
@@ -824,99 +829,6 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        // Custom scheme that proxies Proton's anti-abuse challenge HTML into WebKit iframes.
-        // The JS init script rewrites challenge iframe srcs from /api/challenge/... to
-        // pdchallenge://challenge/api/challenge/... so navigation is allowed and this handler
-        // serves the real content fetched from account.proton.me.
-        .register_uri_scheme_protocol("pdchallenge", |_app, request| {
-            use tauri::http::Response;
-            let uri = request.uri();
-            let path = uri.path();
-            let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-            let real_url = format!("https://account.proton.me{}{}", path, query);
-            println!("[Challenge] Proxying: {}", real_url);
-
-            let make_error = |code: u16, msg: &str| -> Response<Vec<u8>> {
-                Response::builder()
-                    .status(code)
-                    .header("Content-Type", "text/plain")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(msg.as_bytes().to_vec())
-                    .unwrap_or_else(|_| Response::new(vec![]))
-            };
-
-            let client = match reqwest::blocking::Client::builder()
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[Challenge] Client build error: {}", e);
-                    return make_error(500, "client build failed");
-                }
-            };
-
-            let resp = match client.get(&real_url)
-                .header("Origin", "https://account.proton.me")
-                .header("Referer", "https://account.proton.me/")
-                .send()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[Challenge] Request error: {}", e);
-                    return make_error(502, "upstream request failed");
-                }
-            };
-
-            let status = resp.status().as_u16();
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("text/html")
-                .to_string();
-
-            let body_bytes = match resp.bytes() {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[Challenge] Body read error: {}", e);
-                    return make_error(502, "body read failed");
-                }
-            };
-
-            // For HTML responses inject a base href so relative subresource URLs in the
-            // challenge frame resolve back through our pdchallenge:// handler.
-            let final_body: Vec<u8> = if content_type.contains("html") {
-                let html = String::from_utf8_lossy(&body_bytes);
-                let base_tag = r#"<base href="pdchallenge://challenge/">"#;
-                if html.contains("<head>") {
-                    html.replacen("<head>", &format!("<head>{}", base_tag), 1)
-                        .into_bytes()
-                } else if let Some(idx) = html.to_lowercase().find("<head") {
-                    // Find end of opening <head ...> tag
-                    if let Some(end) = html[idx..].find('>') {
-                        let insert_at = idx + end + 1;
-                        let mut s = html.into_owned();
-                        s.insert_str(insert_at, base_tag);
-                        s.into_bytes()
-                    } else {
-                        format!("{}{}", base_tag, html).into_bytes()
-                    }
-                } else {
-                    format!("{}{}", base_tag, html).into_bytes()
-                }
-            } else {
-                body_bytes.to_vec()
-            };
-
-            Response::builder()
-                .status(status)
-                .header("Content-Type", content_type)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(final_body)
-                .unwrap_or_else(|_| Response::new(vec![]))
-        })
         .setup(move |app| {
             let webview_data_dir = persistent_webview_data_dir(app.path().app_data_dir()?);
             ensure_webview_data_dir(&webview_data_dir)?;
@@ -1015,6 +927,7 @@ fn main() {
 (function() {{
     {}
 "#, worker_init) + r#"
+    // __INIT_SCRIPT_JS_BEGIN__  (marker for scripts/ci/check-init-script-syntax.sh)
 
     // Idempotency: safe to re-inject via on_page_load without double-installing
     if (window.__pdProxyInstalled) return;
@@ -1601,7 +1514,11 @@ fn main() {
                         captchaPending = true;
                         const token = data.Details.HumanVerificationToken;
                         // Use the WebUrl provided by Proton (points to verify.proton.me)
-                        const captchaUrl = data.Details.WebUrl || ('https://verify.proton.me/?methods=captcha&token=*** + encodeURIComponent(token));
+                        // Built with URLSearchParams on purpose: a literal `token='...'` in this
+                        // source was once rewritten by a secret-redaction pass into an
+                        // unterminated string, which made WebKit reject this whole script.
+                        const captchaUrl = data.Details.WebUrl
+                            || ('https://verify.proton.me/?' + new URLSearchParams({ methods: 'captcha', token: token }).toString());
                         console.log('[CAPTCHA] Detected 9001, navigating to:', captchaUrl);
 
                         // Try to capture current login credentials from form before navigating
@@ -1723,6 +1640,7 @@ fn main() {
         }
     }, true);
 
+    // __INIT_SCRIPT_JS_END__
 })();
 "#;
 
@@ -1733,7 +1651,82 @@ fn main() {
                 .min_inner_size(800.0, 600.0)
                 .data_directory(webview_data_dir)
                 .initialization_script(init_script.clone())
-                .devtools(true)  // Enable right-click -> Inspect
+                .devtools(true)  // Enable right-click -> Inspect (needs the `devtools` cargo feature in release)
+                // Serve Proton's anti-abuse challenge frames from the app's own origin.
+                //
+                // The account app embeds <iframe src="/api/challenge/v4/html?...">. Proton's
+                // ChallengeFrame only accepts postMessage traffic whose origin equals the
+                // iframe src origin (tauri://localhost), so the challenge HTML has to be served
+                // by the tauri:// protocol itself — a separate custom scheme can never pass
+                // that check. Without this handler Tauri's asset resolver falls back to
+                // index.html for the unknown path, booting a second copy of Drive inside the
+                // iframe (the login redirect loop seen in earlier builds).
+                //
+                // Note: this runs on the WebKit main thread, so the upstream fetch briefly
+                // blocks the UI. Only the two login-page challenge frames hit it.
+                .on_web_resource_request(|request, response| {
+                    use std::borrow::Cow;
+                    use tauri::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
+
+                    let uri = request.uri();
+                    if !uri.path().starts_with("/api/challenge/") {
+                        return;
+                    }
+                    let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                    let upstream = format!("{}{}{}", CHALLENGE_UPSTREAM_ORIGIN, uri.path(), query);
+                    println!("[Challenge] Fetching frame from {}", sanitize_url_for_log(&upstream));
+
+                    // Tauri stamps HTML assets with a CSP carrying per-load nonces. Once a nonce
+                    // is present browsers ignore 'unsafe-inline', which would block the
+                    // challenge page's inline scripts (it ships its own nonces). Drop it.
+                    response.headers_mut().remove("Content-Security-Policy");
+
+                    let fetched = reqwest::blocking::Client::builder()
+                        .user_agent(CHALLENGE_USER_AGENT)
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| {
+                            client
+                                .get(&upstream)
+                                .header("Referer", format!("{}/", CHALLENGE_UPSTREAM_ORIGIN))
+                                .send()
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|resp| {
+                            let status = resp.status().as_u16();
+                            let content_type = resp
+                                .headers()
+                                .get(CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("text/html; charset=UTF-8")
+                                .to_string();
+                            resp.bytes()
+                                .map(|b| (status, content_type, b.to_vec()))
+                                .map_err(|e| e.to_string())
+                        });
+
+                    match fetched {
+                        Ok((status, content_type, body)) => {
+                            println!("[Challenge] upstream status={} bytes={}", status, body.len());
+                            *response.status_mut() =
+                                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                            if let Ok(v) = HeaderValue::from_str(&content_type) {
+                                response.headers_mut().insert(CONTENT_TYPE, v);
+                            }
+                            *response.body_mut() = Cow::Owned(body);
+                        }
+                        Err(e) => {
+                            eprintln!("[Challenge] upstream fetch failed: {}", e);
+                            *response.status_mut() = StatusCode::BAD_GATEWAY;
+                            response
+                                .headers_mut()
+                                .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
+                            *response.body_mut() =
+                                Cow::Borrowed(&b"<!doctype html><title>challenge unavailable</title>"[..]);
+                        }
+                    }
+                })
                 .on_download(|_webview, event| {
                     use tauri::webview::DownloadEvent;
                     match event {
@@ -1955,51 +1948,13 @@ fn main() {
                         return false;
                     }
 
-                    // Allow pdchallenge:// — our custom scheme that proxies Proton's
-                    // anti-abuse challenge HTML so iframes load correctly.
-                    if url.scheme() == "pdchallenge" {
-                        println!("[Navigation] Allowing challenge frame: {}", url_str);
+                    // Proton's anti-abuse challenge frames are <iframe src="/api/challenge/v4/html?...">,
+                    // which resolve to tauri://localhost/api/challenge/... . The
+                    // on_web_resource_request handler below serves the real challenge HTML for
+                    // that path, so let these frames load. Every other /api/ navigation stays blocked.
+                    if is_challenge_frame_url(url) {
+                        println!("[Challenge] Allowing challenge frame navigation: {}", url_str);
                         return true;
-                    }
-
-                    // Challenge iframes: on_navigation fires for tauri://localhost/api/challenge/...
-                    // because WebKit resolves the relative src before any JS can intercept it.
-                    // Block the navigation, then redirect the iframe to pdchallenge:// via eval —
-                    // our custom protocol handler proxies the real challenge HTML from Proton.
-                    if url.scheme() == "tauri"
-                        && url.host_str() == Some("localhost")
-                        && url.path().starts_with("/api/challenge/")
-                    {
-                        let pdc_url = format!(
-                            "pdchallenge://challenge{}{}",
-                            url.path(),
-                            url.query().map(|q| format!("?{}", q)).unwrap_or_default()
-                        );
-                        println!("[Challenge] Redirecting blocked iframe to: {}", pdc_url);
-                        if let Some(window) = app_handle_nav.get_webview_window("main") {
-                            let pdc = pdc_url.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let pdc_js = serde_json::to_string(&pdc)
-                                    .unwrap_or_else(|_| format!("\"{}\"", pdc));
-                                let js = format!(
-                                    r#"(function(){{
-                                        var pdc = {pdc_js};
-                                        var frames = document.querySelectorAll('iframe');
-                                        for (var i = 0; i < frames.length; i++) {{
-                                            var s = frames[i].getAttribute('src') || '';
-                                            if (s.includes('/api/challenge/')) {{
-                                                frames[i].setAttribute('src', pdc);
-                                                console.log('[Challenge] iframe', i, 'redirected to pdchallenge://');
-                                                break;
-                                            }}
-                                        }}
-                                    }})();"#,
-                                    pdc_js = pdc_js
-                                );
-                                let _ = window.eval(&js);
-                            });
-                        }
-                        return false;
                     }
 
                     // Allow tauri://, about: URLs but BLOCK /api/ navigation (API calls should use fetch, not navigate)
@@ -2011,7 +1966,6 @@ fn main() {
 
                     url.scheme() == "tauri"
                         || url.scheme() == "about"
-                        || url.scheme() == "pdchallenge"
                         || url.host_str() == Some("localhost")
                         || url.host_str() == Some("tauri.localhost")
                 })
