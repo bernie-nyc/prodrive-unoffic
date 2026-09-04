@@ -27,8 +27,18 @@ runs:
       shell: bash
       run: |
         TAG="${{ steps.version.outputs.version }}"
-        if git ls-remote --tags origin | grep -q "refs/tags/${TAG}$"; then
-          echo "Tag ${TAG} already exists on remote, skipping creation"
+        EXISTING=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" "refs/tags/${TAG}" | awk '{print $1}' | tail -1)
+        if [ -n "$EXISTING" ]; then
+          if [ "$EXISTING" = "$GITHUB_SHA" ]; then
+            echo "Tag ${TAG} already points at ${GITHUB_SHA}; re-publishing the same commit"
+          else
+            # Every dispatch used to land here and silently overwrite the assets of
+            # an already-published release with a newer build, so "latest release"
+            # never moved even though the .deb files changed underneath users.
+            echo "::error::Tag ${TAG} already exists at ${EXISTING}, but this run is ${GITHUB_SHA}."
+            echo "::error::Bump the version (package.json, package-lock.json, tauri.conf.json, Cargo.toml, Cargo.lock) or pass an unused 'tag' input."
+            exit 1
+          fi
         else
           echo "Creating tag ${TAG}..."
           git config user.name "github-actions[bot]"

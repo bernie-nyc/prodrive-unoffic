@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.1.1 - 2026-09-02
+
+### Fixed
+
+- Login failed with "cannot fetch server time" in every build since May: the
+  JavaScript injected into the WebView contained an unterminated string, so
+  WebKit rejected the whole script and the API proxy never ran. The string is
+  rebuilt with `URLSearchParams`, and a CI gate now parses the injected script
+  with node before any package is built.
+- Proton's anti-abuse challenge frames are served from the app origin through
+  Tauri's web resource handler instead of being blocked, which avoids
+  unnecessary CAPTCHA prompts at login.
+- The packaging build pins Proton's webpack toolchain to the versions in the
+  upstream `yarn.lock`; webpack 5.110 had broken every app build.
+- Release automation refuses to reuse an existing tag and only publishes from
+  `main`, so new work can no longer be silently uploaded into an old release.
+
+### Added
+
+- Release builds keep the WebKit inspector available (right-click > Inspect
+  Element) for diagnosing login problems in the field.
+
 ## 1.3.1 - 2026-05-15
 
 ### Added
