@@ -18,6 +18,18 @@ permissions:
   contents: read
 
 jobs:
+  init_script_syntax_check:
+    name: WebView Init Script Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse the JavaScript injected into the WebView
+        run: bash scripts/ci/check-init-script-syntax.sh
+
   login_routing_regression_checks:
     name: Login/2FA Routing Regression Checks
     runs-on: ubuntu-latest

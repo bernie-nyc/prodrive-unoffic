@@ -28,6 +28,17 @@ inaccessible from CI/build environments. This script performs several fixups:
    registries unreachable from CI), overrides npmRegistryServer to the public
    registry, and disables immutable installs for CI compatibility.
 
+6. PIN THE BUILD TOOLCHAIN — build-webclients.sh empties WebClients/yarn.lock
+   before `yarn install`, so every dependency floats to the newest version that
+   satisfies its range. For the webpack toolchain that is dangerous: webpack
+   5.110 (published after Proton locked 5.109.2) changed how
+   `optimization.minimize` is normalised and esbuild-loader then fed esbuild a
+   non-boolean `minify`, failing every app build with
+   `"minify" must be a boolean`. This step reads the upstream yarn.lock while
+   it still exists and pins each dependency of @proton/pack (the package that
+   owns the webpack config) to its locked version via the root `resolutions`
+   field, so the toolchain stays at the combination Proton actually tested.
+
 Run BEFORE `yarn install` in WebClients. Requires WebClients/ to exist (cloned).
 """
 import json
@@ -200,3 +211,120 @@ if 'enableImmutableInstalls' not in yarnrc_content:
 
 yarnrc_path.write_text(yarnrc_content)
 print("✅ Yarn configured with public npm registry")
+
+# Stub removed @proton/components exports.
+# DrawerAppButton was removed from @proton/components upstream.
+# Rather than patching the barrel (whose path changes across WebClients versions),
+# we patch the Drive app's DriveWindow.tsx to define a local no-op stub and
+# remove the now-missing import so the webpack build doesn't fail.
+print("\nPatching removed @proton/components exports...")
+drive_window_path = Path('WebClients/applications/drive/src/app/legacy/components/layout/DriveWindow.tsx')
+if drive_window_path.exists():
+    content = drive_window_path.read_text()
+    if 'DrawerAppButton' in content:
+        import re as _re
+
+        # 1. Remove DrawerAppButton from any { ..., DrawerAppButton, ... } import line
+        content = _re.sub(r',\s*DrawerAppButton\b', '', content)
+        content = _re.sub(r'\bDrawerAppButton\s*,', '', content)
+        # Handle the case where it's the only import in the braces
+        content = _re.sub(r'\{\s*DrawerAppButton\s*\}', '{}', content)
+
+        # 2. Add a local stub after the last import in the file so any remaining
+        #    JSX references compile.  If there are no remaining references the
+        #    stub is harmless.
+        last_import_match = None
+        for m in _re.finditer(r'^import .+$', content, _re.MULTILINE):
+            last_import_match = m
+        stub_component = (
+            "\n// Compatibility stub — DrawerAppButton removed from @proton/components\n"
+            "const DrawerAppButton: React.FC<Record<string, unknown>> = () => null;\n"
+        )
+        if last_import_match and 'const DrawerAppButton' not in content:
+            insert_pos = last_import_match.end()
+            content = content[:insert_pos] + stub_component + content[insert_pos:]
+
+        drive_window_path.write_text(content)
+        print("  Patched DriveWindow.tsx: removed DrawerAppButton import, added no-op stub")
+    else:
+        print("  DriveWindow.tsx: DrawerAppButton not present (already clean)")
+else:
+    print("  DriveWindow.tsx not found — skipping DrawerAppButton patch")
+
+
+# Pin the build toolchain to the versions in the upstream lockfile.
+# build-webclients.sh truncates yarn.lock before installing, so without this
+# every @proton/pack dependency (webpack, webpack-cli, esbuild-loader, swc,
+# terser-webpack-plugin, ...) resolves to whatever npm published most recently.
+# Proton only ever tested the combination recorded in their yarn.lock; copy it
+# into root `resolutions` so the wiped lockfile cannot drift the toolchain.
+def parse_yarn_lock_versions(lock_text):
+    """Map package name -> set of locked versions (npm: descriptors only)."""
+    versions = {}
+    current_names = []
+    for line in lock_text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        if line[0] not in ' \t':
+            current_names = []
+            header = line.rstrip()
+            if not header.endswith(':') or header.startswith('__metadata'):
+                continue
+            header = header[:-1].strip().strip('"')
+            for descriptor in header.split(', '):
+                descriptor = descriptor.strip().strip('"')
+                at = descriptor.find('@', 1)
+                if at == -1:
+                    continue
+                name, spec = descriptor[:at], descriptor[at + 1:]
+                if spec.startswith('npm:'):
+                    current_names.append(name)
+            continue
+        stripped = line.strip()
+        if stripped.startswith('version:') and current_names:
+            version = stripped[len('version:'):].strip().strip('"')
+            for name in current_names:
+                versions.setdefault(name, set()).add(version)
+            current_names = []
+    return versions
+
+
+print("\nPinning build toolchain to upstream yarn.lock versions...")
+lock_path = Path('WebClients/yarn.lock')
+pack_pkg_path = Path('WebClients/packages/pack/package.json')
+root_pkg_path = Path('WebClients/package.json')
+if not lock_path.exists() or lock_path.stat().st_size == 0:
+    print("  Warning: WebClients/yarn.lock missing or empty — toolchain not pinned")
+elif not pack_pkg_path.exists() or not root_pkg_path.exists():
+    print("  Warning: packages/pack/package.json or root package.json missing — toolchain not pinned")
+else:
+    locked = parse_yarn_lock_versions(lock_path.read_text())
+    pack_data = json.loads(pack_pkg_path.read_text())
+    root_data = json.loads(root_pkg_path.read_text())
+    resolutions = root_data.setdefault('resolutions', {})
+    pinned, skipped_multi, skipped_missing = [], [], []
+    for name in sorted(pack_data.get('dependencies', {})):
+        if name.startswith('@proton/') or name in resolutions:
+            continue
+        found = locked.get(name)
+        if not found:
+            skipped_missing.append(name)
+        elif len(found) > 1:
+            # Several incompatible ranges coexist in the tree; a blanket pin
+            # would force them all onto one version. Leave those alone.
+            skipped_multi.append(f"{name} ({', '.join(sorted(found))})")
+        else:
+            version = next(iter(found))
+            resolutions[name] = version
+            pinned.append(f"{name}@{version}")
+    root_pkg_path.write_text(json.dumps(root_data, indent=4) + '\n')
+    print(f"  Pinned {len(pinned)} toolchain packages via root resolutions")
+    for entry in pinned:
+        print(f"    {entry}")
+    if skipped_multi:
+        print(f"  Left unpinned (multiple locked versions): {', '.join(skipped_multi)}")
+    if skipped_missing:
+        print(f"  Left unpinned (not in yarn.lock): {', '.join(skipped_missing)}")
+    if 'webpack' not in resolutions:
+        print("  ERROR: webpack was not pinned; the build toolchain would float")
+        sys.exit(1)

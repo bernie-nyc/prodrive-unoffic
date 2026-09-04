@@ -30,7 +30,8 @@ mod webview_cookies;
 mod webview_storage;
 
 use proton_navigation::{
-    account_login_complete_redirect_url, captcha_completion_token, unsupported_app_redirect_url,
+    account_login_complete_redirect_url, captcha_completion_token, is_challenge_frame_url,
+    unsupported_app_redirect_url,
 };
 use url_log::sanitize_url_for_log;
 use webview_cookies::{combined_cookie_header, store_webview_cookie};
@@ -38,6 +39,10 @@ use webview_storage::{ensure_webview_data_dir, persistent_webview_data_dir};
 
 /// Base URL for the Proton API.
 const PROTON_API_BASE: &str = "https://mail.proton.me";
+/// Origin that serves Proton's anti-abuse challenge frames (`/api/challenge/...`).
+const CHALLENGE_UPSTREAM_ORIGIN: &str = "https://account.proton.me";
+const CHALLENGE_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// Error message shown when a sync command is invoked from an untrusted origin.
 const ERR_SYNC_NOT_ALLOWED: &str = "Sync operation is not allowed in this context";
@@ -922,6 +927,11 @@ fn main() {
 (function() {{
     {}
 "#, worker_init) + r#"
+    // __INIT_SCRIPT_JS_BEGIN__  (marker for scripts/ci/check-init-script-syntax.sh)
+
+    // Idempotency: safe to re-inject via on_page_load without double-installing
+    if (window.__pdProxyInstalled) return;
+    window.__pdProxyInstalled = true;
 
     // Regression guard for post-2FA Drive load:
     // The Tauri asset protocol must load Drive at tauri://localhost/, but the
@@ -1046,7 +1056,9 @@ fn main() {
             console.log('[Download] Saving:', filename, 'size:', blob.size);
             const buffer = await blob.arrayBuffer();
             const bytes = Array.from(new Uint8Array(buffer));
-            const path = await window.__TAURI__.core.invoke('save_download', {
+            const _invSD = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+            if (!_invSD) throw new Error('Tauri IPC unavailable for download');
+            const path = await _invSD.call(window, 'save_download', {
                 filename: filename,
                 data: bytes
             });
@@ -1192,7 +1204,9 @@ fn main() {
                 try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
                 catch { return String(a); }
             }).join(' ');
-            window.__TAURI__?.core?.invoke('js_log', { msg });
+            // Use __TAURI__ if available (withGlobalTauri), else fall back to internal bridge
+            (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+                ?.call(window, 'js_log', { msg });
         } catch {}
     };
 
@@ -1375,7 +1389,14 @@ fn main() {
     function invokeProxyRequest(payload) {
         const next = proxyInvokeChain
             .catch(() => null)
-            .then(() => window.__TAURI__.core.invoke('proxy_request', payload));
+            .then(() => {
+                // Prefer withGlobalTauri API; fall back to internal bridge which is
+                // always injected by WRY's core regardless of withGlobalTauri setting.
+                const invoke = window.__TAURI__?.core?.invoke
+                    ?? window.__TAURI_INTERNALS__?.invoke;
+                if (!invoke) return Promise.reject(new Error('Tauri IPC unavailable'));
+                return invoke.call(window, 'proxy_request', payload);
+            });
         proxyInvokeChain = next.catch(() => null);
         return next;
     }
@@ -1390,15 +1411,13 @@ fn main() {
             console.log('[FETCH] Fixed protocol-relative URL to:', url);
         }
 
-        // Note: FETCH-level logging removed from hot path.
-        // Each js_log invoke adds IPC pressure that can break the WebKitGTK
-        // IPC bridge under concurrent load (5 SPA fetches + 5 FETCH logs
-        // + 5 PROXY_REQ logs = 15 concurrent invokes, vs ~5 on main).
-        // Rust already logs [Proxy][N] for proxied requests.
-
-        // Temporary fetch diagnostics: log every URL so we can see what the account
-        // app fetches and whether the proxy intercepts it correctly.
-        console.log('[FETCH]', (init.method || 'GET').toUpperCase(), url);
+        // FETCH-level logging intentionally absent: each js_log IPC call goes via
+        // fetch('ipc://...'), which our override intercepts again. Logging here
+        // creates: sendToRust → invoke(js_log) → fetch(ipc://js_log) → this
+        // override → sendToRust → ... (infinite recursion).
+        // Saturating the bridge causes customProtocolIpcFailed=true and fallback to
+        // window.ipc.postMessage, which has a Tauri bug where JSON object responses
+        // (like ProxyResponse) never resolve. Rust logs [Proxy][N] for proxied calls.
 
         // Proxy API calls. Match both /api/ path-prefixed calls (the common case
         // when --api=/api is set) and direct Proton API domain calls where the
@@ -1465,7 +1484,8 @@ fn main() {
             // Check for pending verification token (for auth retry after captcha)
             // Must match /api/core/v4/auth exactly, NOT /auth/cookies or /auth/info
             if (url.includes('/api/core/v4/auth') && !url.includes('/auth/cookies') && !url.includes('/auth/info')) {
-                const verification = await window.__TAURI__.core.invoke('get_and_clear_verification_token');
+                const _inv = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                const verification = _inv ? await _inv.call(window, 'get_and_clear_verification_token') : null;
                 if (verification) {
                     console.log('[CAPTCHA] Adding verification headers to auth request');
                     cleanHeaders['x-pm-human-verification-token'] = verification[0];
@@ -1494,7 +1514,11 @@ fn main() {
                         captchaPending = true;
                         const token = data.Details.HumanVerificationToken;
                         // Use the WebUrl provided by Proton (points to verify.proton.me)
-                        const captchaUrl = data.Details.WebUrl || ('https://verify.proton.me/?methods=captcha&token=*** + encodeURIComponent(token));
+                        // Built with URLSearchParams on purpose: a literal `token='...'` in this
+                        // source was once rewritten by a secret-redaction pass into an
+                        // unterminated string, which made WebKit reject this whole script.
+                        const captchaUrl = data.Details.WebUrl
+                            || ('https://verify.proton.me/?' + new URLSearchParams({ methods: 'captcha', token: token }).toString());
                         console.log('[CAPTCHA] Detected 9001, navigating to:', captchaUrl);
 
                         // Try to capture current login credentials from form before navigating
@@ -1503,7 +1527,8 @@ fn main() {
                             const passInput = document.querySelector('input[name="password"], input[type="password"]');
                             if (emailInput?.value && passInput?.value) {
                                 console.log('[CAPTCHA] Saving login credentials for after captcha');
-                                await window.__TAURI__.core.invoke('store_login_credentials', {
+                                const _invSLC = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                                if (_invSLC) await _invSLC.call(window, 'store_login_credentials', {
                                     username: emailInput.value,
                                     password: passInput.value
                                 });
@@ -1514,10 +1539,11 @@ fn main() {
 
                         // Navigate to REAL verify page as top-level document
                         // This is the ONLY way hCaptcha works in WebKitGTK
-                        window.__TAURI__.core.invoke('navigate_to_captcha', {
+                        const _invNC = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                        if (_invNC) _invNC.call(window, 'navigate_to_captcha', {
                             captchaUrl: captchaUrl,
                             returnUrl: window.location.href
-                        }).catch(err => {
+                        })?.catch?.(err => {
                             console.error('[CAPTCHA] Failed to navigate:', err);
                             captchaPending = false;
                         });
@@ -1613,6 +1639,8 @@ fn main() {
             }
         }
     }, true);
+
+    // __INIT_SCRIPT_JS_END__
 })();
 "#;
 
@@ -1622,8 +1650,83 @@ fn main() {
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(800.0, 600.0)
                 .data_directory(webview_data_dir)
-                .initialization_script(init_script)
-                .devtools(true)  // Enable right-click -> Inspect
+                .initialization_script(init_script.clone())
+                .devtools(true)  // Enable right-click -> Inspect (needs the `devtools` cargo feature in release)
+                // Serve Proton's anti-abuse challenge frames from the app's own origin.
+                //
+                // The account app embeds <iframe src="/api/challenge/v4/html?...">. Proton's
+                // ChallengeFrame only accepts postMessage traffic whose origin equals the
+                // iframe src origin (tauri://localhost), so the challenge HTML has to be served
+                // by the tauri:// protocol itself — a separate custom scheme can never pass
+                // that check. Without this handler Tauri's asset resolver falls back to
+                // index.html for the unknown path, booting a second copy of Drive inside the
+                // iframe (the login redirect loop seen in earlier builds).
+                //
+                // Note: this runs on the WebKit main thread, so the upstream fetch briefly
+                // blocks the UI. Only the two login-page challenge frames hit it.
+                .on_web_resource_request(|request, response| {
+                    use std::borrow::Cow;
+                    use tauri::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
+
+                    let uri = request.uri();
+                    if !uri.path().starts_with("/api/challenge/") {
+                        return;
+                    }
+                    let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                    let upstream = format!("{}{}{}", CHALLENGE_UPSTREAM_ORIGIN, uri.path(), query);
+                    println!("[Challenge] Fetching frame from {}", sanitize_url_for_log(&upstream));
+
+                    // Tauri stamps HTML assets with a CSP carrying per-load nonces. Once a nonce
+                    // is present browsers ignore 'unsafe-inline', which would block the
+                    // challenge page's inline scripts (it ships its own nonces). Drop it.
+                    response.headers_mut().remove("Content-Security-Policy");
+
+                    let fetched = reqwest::blocking::Client::builder()
+                        .user_agent(CHALLENGE_USER_AGENT)
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| {
+                            client
+                                .get(&upstream)
+                                .header("Referer", format!("{}/", CHALLENGE_UPSTREAM_ORIGIN))
+                                .send()
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|resp| {
+                            let status = resp.status().as_u16();
+                            let content_type = resp
+                                .headers()
+                                .get(CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("text/html; charset=UTF-8")
+                                .to_string();
+                            resp.bytes()
+                                .map(|b| (status, content_type, b.to_vec()))
+                                .map_err(|e| e.to_string())
+                        });
+
+                    match fetched {
+                        Ok((status, content_type, body)) => {
+                            println!("[Challenge] upstream status={} bytes={}", status, body.len());
+                            *response.status_mut() =
+                                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                            if let Ok(v) = HeaderValue::from_str(&content_type) {
+                                response.headers_mut().insert(CONTENT_TYPE, v);
+                            }
+                            *response.body_mut() = Cow::Owned(body);
+                        }
+                        Err(e) => {
+                            eprintln!("[Challenge] upstream fetch failed: {}", e);
+                            *response.status_mut() = StatusCode::BAD_GATEWAY;
+                            response
+                                .headers_mut()
+                                .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
+                            *response.body_mut() =
+                                Cow::Borrowed(&b"<!doctype html><title>challenge unavailable</title>"[..]);
+                        }
+                    }
+                })
                 .on_download(|_webview, event| {
                     use tauri::webview::DownloadEvent;
                     match event {
@@ -1666,7 +1769,9 @@ fn main() {
                                         console.log('[Download] Saving blob:', filename, 'size:', blob.size);
                                         const buffer = await blob.arrayBuffer();
                                         const bytes = Array.from(new Uint8Array(buffer));
-                                        const path = await window.__TAURI__.core.invoke('save_download', {{
+                                        const _invBD = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+                                        if (!_invBD) throw new Error('Tauri IPC unavailable for blob download');
+                                        const path = await _invBD.call(window, 'save_download', {{
                                             filename: filename,
                                             data: bytes
                                         }});
@@ -1843,6 +1948,15 @@ fn main() {
                         return false;
                     }
 
+                    // Proton's anti-abuse challenge frames are <iframe src="/api/challenge/v4/html?...">,
+                    // which resolve to tauri://localhost/api/challenge/... . The
+                    // on_web_resource_request handler below serves the real challenge HTML for
+                    // that path, so let these frames load. Every other /api/ navigation stays blocked.
+                    if is_challenge_frame_url(url) {
+                        println!("[Challenge] Allowing challenge frame navigation: {}", url_str);
+                        return true;
+                    }
+
                     // Allow tauri://, about: URLs but BLOCK /api/ navigation (API calls should use fetch, not navigate)
                     // Blocking /api/ prevents iframes from trying to load API endpoints which breaks the account app
                     if url.path().starts_with("/api/") {
@@ -1854,6 +1968,42 @@ fn main() {
                         || url.scheme() == "about"
                         || url.host_str() == Some("localhost")
                         || url.host_str() == Some("tauri.localhost")
+                })
+                .on_page_load({
+                    // Belt-and-suspenders: re-inject the proxy script on account page loads.
+                    // initialization_script fires at document_start, but on some WebKitGTK
+                    // versions a same-origin navigate() call can reuse the document without
+                    // re-firing user scripts. Re-evaluting on PageLoadEvent::Started with
+                    // the idempotency guard (window.__pdProxyInstalled) makes it a no-op
+                    // if the script is already installed.
+                    let page_load_script = init_script.clone();
+                    move |webview, payload| {
+                        use tauri::webview::PageLoadEvent;
+                        let event_label = match payload.event() {
+                            PageLoadEvent::Started => "Started",
+                            PageLoadEvent::Finished => "Finished",
+                            _ => "Unknown",
+                        };
+                        println!("[PageLoad] {} {}", event_label, payload.url());
+                        if payload.event() == PageLoadEvent::Started {
+                            let path = payload.url().path().to_string();
+                            if path.starts_with("/account") || path.starts_with("/verify") {
+                                println!("[PageLoad] Re-injecting proxy for: {}", path);
+                                let _ = webview.eval(&page_load_script);
+                            }
+                            // IPC availability diagnostic — runs after proxy re-injection so
+                            // console.log override is in place when sendToRust fires.
+                            let _ = webview.eval(r#"
+                                (function() {
+                                    var hasTauri = typeof window.__TAURI__?.core?.invoke === 'function';
+                                    var hasInternals = typeof window.__TAURI_INTERNALS__?.invoke === 'function';
+                                    var hasIpc = typeof window.ipc?.postMessage === 'function';
+                                    var installed = !!window.__pdProxyInstalled;
+                                    console.log('[IPC-diag] __TAURI__=' + hasTauri + ' __TAURI_INTERNALS__=' + hasInternals + ' ipc=' + hasIpc + ' proxyInstalled=' + installed);
+                                })();
+                            "#);
+                        }
+                    }
                 })
                 .build()?;
 

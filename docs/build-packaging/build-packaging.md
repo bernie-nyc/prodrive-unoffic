@@ -64,7 +64,7 @@ The Proton web SPA is NOT part of this repository. It comes from `github.com/Pro
 
 1. **Cache-aware** — computes a cache key from WebClients HEAD + build script hashes + patch hashes; reuses `WebClients/applications/drive/dist/` when unchanged
 2. **Clone or use local checkout** — checks `WebClients/` directory first; if missing, does `git clone --depth=1 github.com/ProtonMail/WebClients.git` using `$WEBCLIENTS_REF` (default: `main`)
-3. **Patches dependencies** — runs `scripts/fix_deps.py` to patch `package.json` dependencies for CJS/ESM compat
+3. **Patches dependencies** — runs `scripts/fix_deps.py` to patch `package.json` dependencies for CJS/ESM compat. It also copies the locked version of every `@proton/pack` dependency (webpack, webpack-cli, esbuild-loader, swc, terser-webpack-plugin, ...) from the upstream `yarn.lock` into the root `resolutions` field. The build script empties `yarn.lock` before `yarn install`, so without those pins the toolchain floats to whatever npm published last; webpack 5.110 did exactly that in September 2026 and broke every app build with `"minify" must be a boolean`.
 4. **Applies common patches** — applies patch files from `patches/common/` and runs Python scripts (`patch_drive_linux_drawer.py`, `patch_drive_linux_sync_bridge.py`)
 5. **Creates stubs** — runs `scripts/create_stubs.py` for private Proton npm packages
 6. **Parallel build** — builds THREE apps concurrently via yarn workspaces:

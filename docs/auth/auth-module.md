@@ -234,6 +234,41 @@ This WebKit-native cookie approach is important because Proton's WebClients fron
     headers to prevent the 9001 from re-firing
 ```
 
+### Anti-Abuse Challenge Frames
+
+Separately from CAPTCHA, the account login form embeds two hidden
+`<iframe src="/api/challenge/v4/html?Type=0&Name=unauth|login&...">` frames
+(Proton's `ChallengeFrame`). They compute a browser fingerprint and hand it to
+the form, which sends it as the `Payload` of the auth request. A login without
+that payload still succeeds, but Proton is more likely to answer it with a 9001
+CAPTCHA.
+
+Because the account app is built with `--api=/api`, those frames resolve to
+`tauri://localhost/api/challenge/...`. Two constraints shape how they are served:
+
+- `ChallengeFrame` ignores any `postMessage` whose origin differs from the
+  iframe's `src` origin, so the challenge **must** be served from
+  `tauri://localhost` itself. A separate custom URI scheme cannot work.
+- Tauri's asset resolver falls back to `index.html` for unknown paths, so simply
+  allowing the navigation boots a second copy of Drive inside the iframe and
+  causes a login redirect loop.
+
+`main.rs` therefore lets `/api/challenge/` navigations through
+(`is_challenge_frame_url`, every other `/api/` navigation stays blocked) and an
+`on_web_resource_request` handler replaces the asset response for that path with
+the HTML fetched from `https://account.proton.me/api/challenge/...`. The handler
+also strips Tauri's nonce-bearing CSP header, which would otherwise disable the
+challenge page's inline scripts. Expected log lines:
+
+```
+[Challenge] Allowing challenge frame navigation: tauri://localhost/api/challenge/v4/html?Type=0&Name=login&...
+[Challenge] Fetching frame from https://account.proton.me/api/challenge/v4/html?...
+[Challenge] upstream status=200 bytes=115746
+```
+
+A frame that fails three times (`Retry=1`, `Retry=2` in the navigation log) is
+non-fatal; the form submits without the payload.
+
 ### Web Worker Compatibility
 
 Different Linux packaging formats have varying WebKitGTK Worker support:
@@ -286,6 +321,32 @@ This is controlled at build time via the `DISTRO_TYPE` environment variable.
 2. Look for `The operation is insecure` — this confirms the worker can't start
 3. Verify the patch: grep for `location.protocol === 'tauri:'` in the built frontend bundle
 4. Rebuild with the correct `DISTRO_TYPE` or verify the patch is applied
+
+### "Cannot fetch server time" at Login
+
+**Symptoms:** Submitting the login form fails with Proton's "could not fetch
+server time" error. The terminal log shows `[Navigation]` and `[PageLoad]` lines
+but **no `[Proxy]` and no `[JS]` lines at all**, not even
+`[JS] [LOG] [Tauri] Fetch + XHR proxy installed`.
+
+**Cause:** the WebView init script in `main.rs` did not run. Proton reads the
+server time from the `Date` header of every API response; when the fetch proxy
+is not installed, API calls go to `tauri://localhost/api/...` natively and never
+reach Rust. The script is one large function, so a single JavaScript syntax
+error anywhere in it makes WebKit reject the whole thing silently. This shipped
+for weeks after a secret-redaction pass rewrote `token='` into `token=***`
+inside a string literal.
+
+**Fix:**
+1. Run `bash scripts/ci/check-init-script-syntax.sh` — it extracts the script
+   between the `__INIT_SCRIPT_JS_BEGIN__` / `__INIT_SCRIPT_JS_END__` markers and
+   parses it with node. The DEB build actions and the sanity workflow run the
+   same check.
+2. In a packaged build, right-click > Inspect Element (the `devtools` cargo
+   feature keeps the inspector available in release builds) and look for a
+   `SyntaxError` on the injected script in the console.
+3. Confirm the fix by looking for `[Proxy][0] GET https://mail.proton.me/api/...`
+   lines in the terminal once the login page loads.
 
 ### Session Lost After Restart
 

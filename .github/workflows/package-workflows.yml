@@ -176,9 +176,12 @@ jobs:
       - build_deb_debian_13
       - build_deb_ubuntu_24_04
       - build_deb_ubuntu_26_04
+    # Releases are cut from main only (see CLAUDE.md "Branching"): dispatching
+    # on dev builds the packages for testing but never publishes them.
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
       (inputs.workflow == 'all' || inputs.workflow == 'release') &&
       needs.build_deb_debian_12.result != 'failure' &&
       needs.build_deb_debian_13.result != 'failure' &&
